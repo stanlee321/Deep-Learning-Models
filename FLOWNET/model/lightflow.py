@@ -3,86 +3,27 @@ from tensorflow.keras import backend as K
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import SeparableConv2D, DepthwiseConv2D
 from tensorflow.keras.layers import Input
-from tensorflow.keras.layers import Dense, Add, Activation, Dropout, Flatten, Conv2D, MaxPooling2D
+from tensorflow.keras.layers import Dense, Add, Activation, Dropout, Flatten, Conv2D, MaxPooling2D, LeakyReLU
 from tensorflow.keras.layers import BatchNormalization, Lambda
 from tensorflow.keras.layers import Concatenate, UpSampling2D 
 from tensorflow.image import resize_nearest_neighbor
 from tensorflow.keras import Model
-# from tensorflow.keras.engine import Layer
-# from tensorflow.keras.engine import InputSpec
-# from tensorflow.keras.utils import conv_utils
-# Custom import
+from keras.utils.vis_utils import plot_model
+# Import Own Lib
 from depthwise_conv2d import DepthwiseConvolution2D
 
-"""
-class BilinearUpsampling(Layer):
-    #Just a simple bilinear upsampling layer. Works only with TF.
-       Args:
-           upsampling: tuple of 2 numbers > 0. The upsampling ratio for h and w
-           output_size: used instead of upsampling arg if passed!
-    #
 
-    def __init__(self, upsampling=(2, 2), output_size=None, data_format=None, **kwargs):
-
-        super(BilinearUpsampling, self).__init__(**kwargs)
-
-        self.data_format = K.normalize_data_format(data_format)
-        self.input_spec = InputSpec(ndim=4)
-        if output_size:
-            self.output_size = conv_utils.normalize_tuple(
-                output_size, 2, 'output_size')
-            self.upsampling = None
-        else:
-            self.output_size = None
-            self.upsampling = conv_utils.normalize_tuple(
-                upsampling, 2, 'upsampling')
-
-    def compute_output_shape(self, input_shape):
-        if self.upsampling:
-            height = self.upsampling[0] * \
-                input_shape[1] if input_shape[1] is not None else None
-            width = self.upsampling[1] * \
-                input_shape[2] if input_shape[2] is not None else None
-        else:
-            height = self.output_size[0]
-            width = self.output_size[1]
-        return (input_shape[0],
-                height,
-                width,
-                input_shape[3])
-
-    def call(self, inputs):
-        if self.upsampling:
-            return tf.image.resize_bilinear(inputs, (inputs.shape[1] * self.upsampling[0],
-                                                       inputs.shape[2] * self.upsampling[1]),
-                                              align_corners=True)
-        else:
-            return tf.image.resize_bilinear(inputs, (self.output_size[0],
-                                                       self.output_size[1]),
-                                              align_corners=True)
-
-    def get_config(self):
-        config = {'upsampling': self.upsampling,
-                  'output_size': self.output_size,
-                  'data_format': self.data_format}
-        base_config = super(BilinearUpsampling, self).get_config()
-        return dict(list(base_config.items()) + list(config.items()))
-"""
-
-
-
-def _depthwise_convolution2D(input, alpha, deepwise_filter_size, kernel_size, strides, padding='same', bias=False, activation='relu'):
+def _depthwise_convolution2D(input, alpha, deepwise_filter_size, kernel_size, strides, padding='same', bias=False):
     x= DepthwiseConvolution2D(int(deepwise_filter_size * alpha), kernel_size, strides=strides, padding=padding, use_bias=bias)(input)
     x= BatchNormalization()(x)
-    x = Activation(activation)(x)
-
+    x = LeakyReLU(alpha=0.1)(x)
     return  x
 
-def _convolution2D(input, alpha, deepwise_filter_size, kernel_size, strides, padding='same', bias=False, activation='relu' ):
+def _convolution2D(input, alpha, deepwise_filter_size, kernel_size, strides, padding='same', bias=False):
     x = Conv2D(int(deepwise_filter_size * alpha), kernel_size, strides=strides, padding=padding, use_bias=bias)(input)
     x = BatchNormalization()(x)
-    x = Activation(activation)(x)
-    
+    x = LeakyReLU(alpha=0.1)(x)
+   
     return x
 
 def resize_like(input_tensor, ref_tensor, scale): # resizes input tensor wrt. ref_tensor
@@ -95,15 +36,36 @@ class LightFlow:
 
     def __init__(self):
         pass
+
     @staticmethod
-    def build(input_tensor = None, input_shape=None):
+    def average_endpoint_error(labels, predictions):
+        """
+        Given labels and predictions of size (N, H, W, 2), calculates average endpoint error:
+            sqrt[sum_across_channels{(X - Y)^2}]
+        """
+        num_samples = predictions.shape.as_list()[0]
+        with tf.name_scope(None, "average_endpoint_error", (predictions, labels)) as scope:
+            predictions = tf.to_float(predictions)
+            labels = tf.to_float(labels)
+            predictions.get_shape().assert_is_compatible_with(labels.get_shape())
+
+            squared_difference = tf.square(tf.subtract(predictions, labels))
+            # sum across channels: sum[(X - Y)^2] -> N, H, W, 1
+            loss = tf.reduce_sum(squared_difference, 3, keep_dims=True)
+            loss = tf.sqrt(loss)
+            return tf.reduce_sum(loss) / num_samples
+
+    @staticmethod
+    def build(input_tensor = None, input_shape=None, plot=False):
         if input_tensor is None:
-            img_input = Input(shape=input_shape)
+            input_image = Input(shape=input_shape)
         else:
             if not K.is_keras_tensor(input_tensor):
-                img_input = Input(tensor=input_tensor, shape=input_shape)
+                input_image = Input(tensor=input_tensor, shape=input_shape)
             else:
-                img_input = input_tensor
+                input_image = input_tensor
+
+        concat_axis = 3
         alpha = 1.0
 
         #################################################
@@ -112,7 +74,7 @@ class LightFlow:
        
         # Conv1_dw / Conv1
 
-        conv1_dw = _depthwise_convolution2D(img_input, alpha, 6,  (3, 3), strides=(2, 2))
+        conv1_dw = _depthwise_convolution2D(input_image, alpha, 6,  (3, 3), strides=(2, 2))
         conv1 = _convolution2D(conv1_dw, alpha, 32, (1, 1), strides=(1, 1))
 
         # Conv2_dw / Conv2
@@ -153,32 +115,32 @@ class LightFlow:
         
         # Conv7_dw / Conv7
         conv7_dw =  _depthwise_convolution2D(conv6b, alpha, 1024,  (3, 3), strides=(1, 1))
-        conv7 = _convolution2D(conv6b_dw, alpha, 256, (1, 1), strides=(1, 1))
+        conv7 = _convolution2D(conv7_dw, alpha, 256, (1, 1), strides=(1, 1))
 
         # Conv8_dw /Conv8
         conv7_resized_tensor = Lambda(resize_like, arguments={'ref_tensor':conv7, 'scale': 2})(conv7)
-        concat_op1 = Concatenate(axis=3)([conv7_resized_tensor, conv5b])
+        concat_op1 = Concatenate(axis=concat_axis)([conv7_resized_tensor, conv5b])
         
         conv8_dw = _depthwise_convolution2D(concat_op1, alpha, 768,  (3, 3), strides=(1, 1))
         conv8 = _convolution2D(conv8_dw, alpha, 128, (1, 1), strides=(1, 1))
 
         # Conv9_dw /Conv9
         conv8_resized_tensor = Lambda(resize_like, arguments={'ref_tensor':conv8, 'scale': 2})(conv8)
-        concat_op2 = Concatenate(axis=3)([conv8_resized_tensor, conv4b])
+        concat_op2 = Concatenate(axis=concat_axis)([conv8_resized_tensor, conv4b])
         
         conv9_dw = _depthwise_convolution2D(concat_op2, alpha, 384, (3,3), strides=(1,1))
         conv9 = _convolution2D(conv9_dw, alpha, 64, (1,1), strides=(1,1))
 
         # Conv10_dw / Conv10
         coonv9_resized_tensor = Lambda(resize_like, arguments={'ref_tensor':conv9, 'scale': 2})(conv9)
-        concat_op3 = Concatenate(axis=3)([coonv9_resized_tensor, conv3])
+        concat_op3 = Concatenate(axis=concat_axis)([coonv9_resized_tensor, conv3])
 
         conv10_dw = _depthwise_convolution2D(concat_op3, alpha, 192, (3,3), strides=(1,1))
         conv10 = _convolution2D(conv10_dw, alpha, 32, (1,1), strides=(1,1))
 
         # Conv11_dw / Con11
         conv10_resized_tensor = Lambda(resize_like, arguments={'ref_tensor':conv10, 'scale': 2})(conv10)
-        concat_op3 = Concatenate(axis=3)([conv10_resized_tensor, conv2])
+        concat_op3 = Concatenate(axis=concat_axis)([conv10_resized_tensor, conv2])
 
         conv11_dw = _depthwise_convolution2D(concat_op3, alpha, 96, (3,3), strides=(1,1))
         conv11 = _convolution2D(conv11_dw, alpha, 16, (1,1), strides=(1,1))
@@ -213,17 +175,37 @@ class LightFlow:
         # Multiple Optical Flow Predictions Fusion
         ###################################################
 
-        conv12_resized_tensor_x8 = Lambda(resize_like, arguments={'ref_tensor':conv12, 'scale': 16})(conv12)
-        conv13_resized_tensor_x6 = Lambda(resize_like, arguments={'ref_tensor':conv13, 'scale': 8})(conv13)
+        conv12_resized_tensor_x16 = Lambda(resize_like, arguments={'ref_tensor':conv12, 'scale': 16})(conv12)
+        conv13_resized_tensor_x8 = Lambda(resize_like, arguments={'ref_tensor':conv13, 'scale': 8})(conv13)
         conv14_resized_tensor_x4 = Lambda(resize_like, arguments={'ref_tensor':conv14, 'scale': 4})(conv14)
         conv15_resized_tensor_x2 = Lambda(resize_like, arguments={'ref_tensor':conv15, 'scale': 2})(conv15)
 
-        average = Add()([conv12_resized_tensor_x8, conv13_resized_tensor_x6, conv14_resized_tensor_x4 , conv15_resized_tensor_x2, conv16])
+        average = Add()([conv12_resized_tensor_x16, 
+                                conv13_resized_tensor_x8, 
+                                conv14_resized_tensor_x4 ,
+                                conv15_resized_tensor_x2, 
+                                conv16])
 
+        # optimizer = SGD(nesterov=True, lr=0.00001, momentum=0.1,decay=0.001)
+        # model = Model(inputs = [input_l, input_r], outputs = conv6)
+        # model.compile(optimizer=optimizer,loss='mean_squared_error')
+        # print "Done"
+        
+        #return {
+        #    'predicted_flow': average
+        #}
         # Create model for debug
-        model = Model(inputs=img_input, outputs=average)
+        model = Model(inputs=input_image, outputs=average)
+
         return model
 
-INPUT_SHAPE = (512,384,6)
-model = LightFlow.build(input_shape=INPUT_SHAPE)
-print(model.summary())
+
+def main(plot = True):
+    INPUT_SHAPE = (512,384,6)
+    model = LightFlow.build(input_shape=INPUT_SHAPE)
+    if plot is True:
+        plot_model(model, to_file='LightFLow.png', show_shapes=True)
+    print(model.summary())
+
+if __name__ == '__main__':
+    main()
